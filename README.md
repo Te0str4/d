@@ -130,4 +130,151 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header,
     // packet의 시작 위치는 Ethernet Header이다.
     eth = (struct ethernet_header *)packet;
 
-    // IPv4 패킷
+    // IPv4 패킷만 처리한다.
+    // Ethernet type이 0x0800이면 IPv4이다.
+    if (ntohs(eth->type) != 0x0800) {
+        return;
+    }
+
+    // IP Header는 Ethernet Header 바로 뒤에 위치한다.
+    ip = (struct ip_header *)(packet + ETHERNET_LEN);
+
+    // 과제 조건에 따라 TCP 패킷만 처리한다.
+    if (ip->protocol != IPPROTO_TCP) {
+        return;
+    }
+
+    // IP Header 길이 계산
+    // ihl은 4바이트 단위이므로 실제 길이는 ihl * 4이다.
+    ip_header_len = ip->ihl * 4;
+
+    if (ip_header_len < 20) {
+        return;
+    }
+
+    // TCP Header는 Ethernet Header + IP Header 뒤에 위치한다.
+    tcp = (struct tcp_header *)(packet + ETHERNET_LEN + ip_header_len);
+
+    // TCP Header 길이 계산
+    tcp_header_len = TCP_HEADER_LEN(tcp);
+
+    if (tcp_header_len < 20) {
+        return;
+    }
+
+    // IP 패킷 전체 길이
+    // 네트워크 바이트 순서이므로 ntohs()로 변환한다.
+    ip_total_len = ntohs(ip->total_len);
+
+    // Payload 시작 위치 계산
+    payload_offset = ETHERNET_LEN + ip_header_len + tcp_header_len;
+
+    // Payload 길이 계산
+    payload_len = ip_total_len - ip_header_len - tcp_header_len;
+
+    if (payload_len < 0) {
+        return;
+    }
+
+    // 캡처된 길이보다 payload 위치가 뒤에 있으면 잘못된 패킷이므로 무시한다.
+    if (header->caplen < (bpf_u_int32)payload_offset) {
+        return;
+    }
+
+    // 실제 캡처된 payload 길이에 맞게 보정한다.
+    if (payload_len > (int)header->caplen - payload_offset) {
+        payload_len = (int)header->caplen - payload_offset;
+    }
+
+    // Payload는 전체 헤더 뒤에 위치한다.
+    payload = packet + payload_offset;
+
+    printf("\n========== Packet ==========\n");
+
+    // Ethernet Header 정보 출력
+    printf("[Ethernet Header]\n");
+    printf("src MAC : ");
+    print_mac(eth->src_mac);
+    printf("\n");
+
+    printf("dst MAC : ");
+    print_mac(eth->dst_mac);
+    printf("\n");
+
+    // IP Header 정보 출력
+    printf("[IP Header]\n");
+    printf("src IP  : %s\n", inet_ntoa(ip->src_ip));
+    printf("dst IP  : %s\n", inet_ntoa(ip->dst_ip));
+    printf("IP Header Length : %d bytes\n", ip_header_len);
+
+    // TCP Header 정보 출력
+    // 포트 번호는 네트워크 바이트 순서이므로 ntohs()로 변환한다.
+    printf("[TCP Header]\n");
+    printf("src Port : %d\n", ntohs(tcp->src_port));
+    printf("dst Port : %d\n", ntohs(tcp->dst_port));
+    printf("TCP Header Length : %d bytes\n", tcp_header_len);
+
+    // HTTP Message 또는 Payload 출력
+    printf("[HTTP Message]\n");
+
+    if (payload_len <= 0) {
+        printf("No payload\n");
+    } else if (is_http_payload(payload, payload_len)) {
+        print_payload(payload, payload_len);
+    } else {
+        printf("Payload exists, but it is not plain HTTP data. size = %d bytes\n",
+               payload_len);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    pcap_t *handle;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct bpf_program filter;
+
+    char filter_exp[] = "tcp";  // TCP 패킷만 캡처하기 위한 필터
+    char *dev = "enp0s3";       // VirtualBox Ubuntu에서 사용하는 인터페이스 이름
+    bpf_u_int32 net = 0;
+
+    // 실행할 때 인터페이스 이름을 인자로 받으면 그 값을 사용한다.
+    if (argc >= 2) {
+        dev = argv[1];
+    }
+
+    // 네트워크 인터페이스를 연다.
+    // 세 번째 인자 1은 promiscuous mode를 의미한다.
+    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        printf("pcap_open_live error: %s\n", errbuf);
+        return 1;
+    }
+
+    // tcp 필터를 컴파일한다.
+    if (pcap_compile(handle, &filter, filter_exp, 0, net) == -1) {
+        printf("pcap_compile error: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        return 1;
+    }
+
+    // 컴파일한 필터를 실제 캡처 핸들에 적용한다.
+    if (pcap_setfilter(handle, &filter) == -1) {
+        printf("pcap_setfilter error: %s\n", pcap_geterr(handle));
+        pcap_freecode(&filter);
+        pcap_close(handle);
+        return 1;
+    }
+
+    printf("Start capture on interface: %s\n", dev);
+    printf("Filter: %s\n", filter_exp);
+
+    // 패킷 캡처를 시작한다.
+    // 패킷이 잡힐 때마다 got_packet() 함수가 호출된다.
+    pcap_loop(handle, -1, got_packet, NULL);
+
+    // 사용한 자원을 정리한다.
+    pcap_freecode(&filter);
+    pcap_close(handle);
+
+    return 0;
+}
